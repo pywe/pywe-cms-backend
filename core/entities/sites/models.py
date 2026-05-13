@@ -50,18 +50,120 @@ class Site(TimeStamp):
         return f"{self.name} ({self.slug})"
 
 
+class SiteProfile(TimeStamp):
+    """Site-wide identity, SEO, contact and configuration settings (1:1 with Site).
+
+    All fields are optional. The manager renders the profile as grouped cards
+    (identity, SEO, contact, social, navigation, locale, theme, operations) so
+    workspace owners can fill in what they have without being blocked by what
+    they don't.
+
+    `nav_links` is a JSON list of `{"label": str, "path": str}` entries.
+    `contact_topics` is a JSON list of strings used to populate the contact
+    form topic select. Robots/maintenance booleans default to safe values
+    (`robots_index=True`, `maintenance_enabled=False`).
+    """
+
+    site = models.OneToOneField(
+        Site,
+        on_delete=models.CASCADE,
+        related_name="profile",
+    )
+
+    display_name = models.CharField(max_length=200, blank=True, default="")
+    short_name = models.CharField(max_length=20, blank=True, default="")
+    tagline = models.CharField(max_length=200, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
+    logo = models.ForeignKey(
+        "SiteMedia",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    favicon = models.ForeignKey(
+        "SiteMedia",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    canonical_url = models.URLField(max_length=500, blank=True, default="")
+    seo_title = models.CharField(max_length=200, blank=True, default="")
+    title_template = models.CharField(max_length=200, blank=True, default="")
+    meta_description = models.TextField(blank=True, default="")
+    og_image = models.ForeignKey(
+        "SiteMedia",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    robots_index = models.BooleanField(default=True)
+    twitter_handle = models.CharField(max_length=64, blank=True, default="")
+
+    contact_email = models.EmailField(max_length=254, blank=True, default="")
+    contact_phone = models.CharField(max_length=64, blank=True, default="")
+    contact_address = models.TextField(blank=True, default="")
+    contact_region = models.CharField(max_length=200, blank=True, default="")
+    contact_consent_text = models.TextField(blank=True, default="")
+    contact_topics = models.JSONField(blank=True, default=list)
+
+    social_facebook = models.URLField(max_length=500, blank=True, default="")
+    social_x = models.URLField(max_length=500, blank=True, default="")
+    social_instagram = models.URLField(max_length=500, blank=True, default="")
+    social_linkedin = models.URLField(max_length=500, blank=True, default="")
+    social_youtube = models.URLField(max_length=500, blank=True, default="")
+    social_whatsapp = models.URLField(max_length=500, blank=True, default="")
+
+    nav_links = models.JSONField(blank=True, default=list)
+    nav_cta_label = models.CharField(max_length=64, blank=True, default="")
+    nav_cta_path = models.CharField(max_length=200, blank=True, default="")
+
+    html_lang = models.CharField(max_length=16, blank=True, default="en")
+    og_locale = models.CharField(max_length=16, blank=True, default="")
+    timezone = models.CharField(max_length=64, blank=True, default="")
+    date_format = models.CharField(max_length=32, blank=True, default="")
+
+    primary_color = models.CharField(max_length=20, blank=True, default="")
+    accent_color = models.CharField(max_length=20, blank=True, default="")
+    heading_font = models.CharField(max_length=100, blank=True, default="")
+    body_font = models.CharField(max_length=100, blank=True, default="")
+
+    analytics_id = models.CharField(max_length=120, blank=True, default="")
+    maintenance_enabled = models.BooleanField(default=False)
+    maintenance_message = models.TextField(blank=True, default="")
+    copyright_name = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        app_label = "core"
+        db_table = "site_profile"
+
+    def __str__(self) -> str:
+        return f"{self.site.slug} profile"
+
+
 class SiteContentSlot(TimeStamp):
-    """Content block for a site. `key` is the slot type; many rows may share the same (site, key)."""
+    """Content block for a site. `key` is the slot type; many rows may share the same (site, key).
+
+    `subtype` is only meaningful when `key == "entry"`. It carries the user-facing
+    kind of the entry (e.g. "project", "news", "case-study") so the manager can
+    surface those as distinct content types. The catalogue of supported subtypes
+    is owned by the manager — the backend only validates slug shape and stores
+    whatever it receives. For non-entry slots the column is empty.
+    """
 
     class SlotType(models.TextChoices):
         HERO = "hero", _("Hero")
-        ABOUT = "about", _("About")
         FOOTER = "footer", _("Footer")
         ANNOUNCEMENT = "announcement", _("Announcement / banner")
         CONTACT = "contact", _("Contact / call to action")
+        ENTRY = "entry", _("Entry")
 
     site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="content_slots")
     key = models.SlugField(max_length=64, choices=SlotType.choices)
+    subtype = models.SlugField(max_length=64, blank=True, default="", db_index=True)
     label = models.CharField(max_length=255, blank=True, default="")
     body = models.TextField(blank=True, default="")
 
@@ -74,6 +176,57 @@ class SiteContentSlot(TimeStamp):
         if self.pk:
             return f"{self.site.slug}:{self.key}#{self.pk}"
         return f"{self.site.slug}:{self.key}"
+
+
+class Page(TimeStamp):
+    """A composable page on a site, rendered as an ordered list of typed sections.
+
+    `body` is a JSON envelope of the shape:
+        {"v": 1, "sections": [{"id": str, "kind": str, "value": str}, ...]}
+    The catalogue of valid `kind` values lives in the `@pywe/cms-sections`
+    workspace package (consumed by the Svelte manager and the Next.js public
+    frontend); the backend only enforces the envelope shape and stores
+    `body` verbatim so new kinds can ship without a backend deploy.
+
+    `slug` is a free CharField rather than a SlugField because pages support
+    nested paths (e.g. `press/2026-q1`). The empty string represents the
+    homepage (URL `/`). Slug shape is validated by the serializer.
+
+    `seo` is a JSON dict; the serializer keeps the documented keys
+    (`description`, `ogImage`, `noindex`) and drops unknown ones.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", _("Draft")
+        PUBLISHED = "published", _("Published")
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="pages")
+    slug = models.CharField(max_length=255, blank=True, default="")
+    title = models.CharField(max_length=255, blank=True, default="")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+    )
+    body = models.TextField(blank=True, default="")
+    seo = models.JSONField(blank=True, default=dict)
+
+    class Meta:
+        app_label = "core"
+        db_table = "site_page"
+        ordering = ["slug", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "slug"],
+                name="uniq_site_page_slug",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        display_slug = self.slug or "/"
+        if self.pk:
+            return f"{self.site.slug}:{display_slug}#{self.pk}"
+        return f"{self.site.slug}:{display_slug}"
 
 
 def site_media_upload_to(instance: "SiteMedia", filename: str) -> str:
@@ -139,9 +292,10 @@ class SiteMedia(TimeStamp):
 
 
 # Manager API hints for each slot type (keep keys in sync with SiteContentSlot.SlotType).
+# `entry` is intentionally omitted: the manager exposes its subtypes (project, news, …)
+# as distinct content types via its own kind registry, not as a single "Entry" card.
 CONTENT_SLOT_TYPE_HINTS: dict[str, str] = {
     "hero": "Compose the hero from optional sections (eyebrow, headline, subheadline, copy, background image from Media, buttons). Add only what you need.",
-    "about": "Structured About copy: intro, story, mission, team, trust, and optional call to action.",
     "footer": "Footer links and copy, plus optional legal or compliance text.",
     "announcement": "Site-wide banner or alert message.",
     "contact": "Contact block, address, or primary call to action.",

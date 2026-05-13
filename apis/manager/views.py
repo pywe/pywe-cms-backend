@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 
 from django.conf import settings
 from django.core.cache import cache
@@ -21,6 +22,9 @@ from apis.manager.serializers import (
     ManagerOtpVerifySerializer,
     ManagerProfilePatchSerializer,
     ManagerRegisterSerializer,
+    PageCreateSerializer,
+    PagePatchSerializer,
+    PageReadSerializer,
     SiteContentSlotCreateSerializer,
     SiteContentSlotPatchSerializer,
     SiteContentSlotReadSerializer,
@@ -33,12 +37,22 @@ from apis.manager.serializers import (
     SiteMediaReadSerializer,
     SiteCreateSerializer,
     SitePatchSerializer,
+    SiteProfilePatchSerializer,
+    SiteProfileReadSerializer,
     SiteReadSerializer,
     WorkspaceCreateSerializer,
     WorkspaceReadSerializer,
 )
 from apis.utils import envelope
-from core.entities.sites.models import CONTENT_SLOT_TYPE_HINTS, Site, SiteContentSlot, SiteMedia, SiteMediaGroup
+from core.entities.sites.models import (
+    CONTENT_SLOT_TYPE_HINTS,
+    Page,
+    Site,
+    SiteContentSlot,
+    SiteMedia,
+    SiteMediaGroup,
+    SiteProfile,
+)
 from core.entities.users.models import Account
 from core.entities.workspaces.models import Membership, Workspace, generate_workspace_api_key
 from utils.sms import SMSNotification, SMSTemplate
@@ -46,6 +60,9 @@ from utils.sms import SMSNotification, SMSTemplate
 logger = logging.getLogger(__name__)
 OTP_CACHE_KEY_PREFIX = "manager:otp:"
 OTP_TTL_SECONDS = 300
+
+# Mirrors Django SlugField shape; used to validate `?subtype=` query params.
+_SLOT_SUBTYPE_RE = re.compile(r"[-a-zA-Z0-9_]+")
 
 
 def _otp_cache_key(phone_number: str) -> str:
@@ -643,7 +660,13 @@ class SiteMediaBulkDeleteView(APIView):
 
 
 class SiteContentSlotTypesView(APIView):
-    """Predefined slot types for the manager UI (key, label, content hint)."""
+    """Predefined slot types for the manager UI (key, label, content hint).
+
+    `entry` is excluded: its user-facing kinds (project, news, …) are surfaced
+    by the manager via its own kind registry rather than as a single Entry card.
+    """
+
+    _HIDDEN_SLOT_KEYS = {"entry"}
 
     permission_classes = [IsAuthenticated]
 
@@ -659,6 +682,7 @@ class SiteContentSlotTypesView(APIView):
                 "hint": CONTENT_SLOT_TYPE_HINTS.get(choice.value, ""),
             }
             for choice in SiteContentSlot.SlotType
+            if choice.value not in self._HIDDEN_SLOT_KEYS
         ]
         return Response(
             envelope(True, data={"slot_types": slot_types}),
@@ -687,6 +711,14 @@ class SiteContentSlotListCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             slots = slots.filter(key=key_filter)
+        subtype_filter = (request.query_params.get("subtype") or "").strip()
+        if subtype_filter:
+            if not _SLOT_SUBTYPE_RE.fullmatch(subtype_filter):
+                return Response(
+                    {"detail": "Invalid subtype filter."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            slots = slots.filter(subtype=subtype_filter)
         slots = slots.order_by("key", "id")
         return Response(
             envelope(True, data={"slots": SiteContentSlotReadSerializer(slots, many=True).data}),
@@ -713,6 +745,7 @@ class SiteContentSlotListCreateView(APIView):
         slot = SiteContentSlot.objects.create(
             site=site,
             key=key,
+            subtype=serializer.validated_data.get("subtype") or "",
             label=label,
             body=serializer.validated_data.get("body") or "",
         )
@@ -782,6 +815,220 @@ class SiteContentSlotDetailView(APIView):
         if not deleted:
             return Response({"detail": "Slot not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(envelope(True, message="Slot removed."), status=status.HTTP_200_OK)
+
+
+class SitePageListCreateView(APIView):
+    """List pages on a site, or create a new one (owner mutates).
+
+    Optional query params:
+      - `?slug=<slug>` returns only the page with that exact slug
+        (empty value matches the homepage `""`). Useful for the frontend
+        renderer's slug → page lookup.
+      - `?status=<draft|published>` filters by lifecycle state.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, site_slug, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        _membership, site = pair
+        pages = Page.objects.filter(site=site)
+
+        if "slug" in request.query_params:
+            raw_slug = request.query_params.get("slug") or ""
+            pages = pages.filter(slug=raw_slug.strip().strip("/").lower())
+
+        status_filter = (request.query_params.get("status") or "").strip()
+        if status_filter:
+            allowed = {c.value for c in Page.Status}
+            if status_filter not in allowed:
+                return Response(
+                    {"detail": "Invalid status filter."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            pages = pages.filter(status=status_filter)
+
+        pages = pages.order_by("slug", "id")
+        return Response(
+            envelope(True, data={"pages": PageReadSerializer(pages, many=True).data}),
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, site_slug, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        membership, site = pair
+        if not manager_may_mutate_sites(membership):
+            return Response(
+                {"detail": "Only a workspace owner can create pages."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        serializer = PageCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        slug = serializer.validated_data["slug"]
+        if Page.objects.filter(site=site, slug=slug).exists():
+            return Response(
+                {"detail": "A page with this slug already exists on the site."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        page = Page.objects.create(
+            site=site,
+            slug=slug,
+            title=serializer.validated_data.get("title", ""),
+            status=serializer.validated_data.get("status", Page.Status.DRAFT),
+            body=serializer.validated_data.get("body", ""),
+            seo=serializer.validated_data.get("seo", {}) or {},
+        )
+        return Response(
+            envelope(
+                True,
+                data={"page": PageReadSerializer(page).data},
+                message="Page created.",
+            ),
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class SitePageDetailView(APIView):
+    """Retrieve, update, or delete a single page by id."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, site_slug, page_id, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        _membership, site = pair
+        page = Page.objects.filter(site=site, pk=page_id).first()
+        if page is None:
+            return Response({"detail": "Page not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            envelope(True, data={"page": PageReadSerializer(page).data}),
+            status=status.HTTP_200_OK,
+        )
+
+    def patch(self, request, site_slug, page_id, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        membership, site = pair
+        if not manager_may_mutate_sites(membership):
+            return Response(
+                {"detail": "Only a workspace owner can update pages."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        page = Page.objects.filter(site=site, pk=page_id).first()
+        if page is None:
+            return Response({"detail": "Page not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = PagePatchSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if "slug" in data:
+            new_slug = data["slug"]
+            if new_slug != page.slug and Page.objects.filter(site=site, slug=new_slug).exists():
+                return Response(
+                    {"detail": "Another page on this site already uses that slug."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        update_fields: list[str] = []
+        for key in ("slug", "title", "status", "body", "seo"):
+            if key in data:
+                setattr(page, key, data[key] if key != "seo" else (data[key] or {}))
+                update_fields.append(key)
+        if update_fields:
+            update_fields.append("updated_at")
+            page.save(update_fields=update_fields)
+        return Response(
+            envelope(
+                True,
+                data={"page": PageReadSerializer(page).data},
+                message="Page updated.",
+            ),
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, site_slug, page_id, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        membership, site = pair
+        if not manager_may_mutate_sites(membership):
+            return Response(
+                {"detail": "Only a workspace owner can delete pages."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        deleted, _ = Page.objects.filter(site=site, pk=page_id).delete()
+        if not deleted:
+            return Response({"detail": "Page not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(envelope(True, message="Page removed."), status=status.HTTP_200_OK)
+
+
+class SiteProfileView(APIView):
+    """Retrieve or update the site-wide profile (identity, SEO, contact, social, …).
+
+    GET returns the profile (creating an empty one on first read so the manager
+    can rely on a stable shape). PATCH accepts any subset of fields; missing
+    fields are left untouched. Mutations require workspace owner role to match
+    other site-mutating endpoints.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def _get_profile(self, site: Site) -> SiteProfile:
+        profile, _ = SiteProfile.objects.get_or_create(site=site)
+        return profile
+
+    def get(self, request, site_slug, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        _membership, site = pair
+        profile = self._get_profile(site)
+        return Response(
+            envelope(True, data={"profile": SiteProfileReadSerializer(profile).data}),
+            status=status.HTTP_200_OK,
+        )
+
+    def patch(self, request, site_slug, *args, **kwargs):
+        account = request.user
+        pair, err = _manager_site_for_slug(account, site_slug)
+        if err:
+            return err
+        membership, site = pair
+        if not manager_may_mutate_sites(membership):
+            return Response(
+                {"detail": "Only a workspace owner can update the site profile."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        profile = self._get_profile(site)
+        serializer = SiteProfilePatchSerializer(
+            data=request.data,
+            partial=True,
+            context={"site": site, "request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.apply(profile)
+        return Response(
+            envelope(
+                True,
+                data={"profile": SiteProfileReadSerializer(profile).data},
+                message="Site profile updated.",
+            ),
+            status=status.HTTP_200_OK,
+        )
 
 
 class WorkspaceRotateApiKeyView(APIView):

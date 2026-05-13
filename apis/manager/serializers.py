@@ -1,10 +1,19 @@
+import json
+import re
 from pathlib import Path
 
 from django.utils.text import slugify
 from phonenumber_field.serializerfields import PhoneNumberField
 from rest_framework import serializers
 
-from core.entities.sites.models import Site, SiteContentSlot, SiteMedia, SiteMediaGroup
+from core.entities.sites.models import (
+    Page,
+    Site,
+    SiteContentSlot,
+    SiteMedia,
+    SiteMediaGroup,
+    SiteProfile,
+)
 from core.entities.users.models import Account
 from core.entities.workspaces.models import Workspace
 
@@ -177,7 +186,16 @@ class SiteContentSlotReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SiteContentSlot
-        fields = ("id", "key", "type_label", "label", "body", "created_at", "updated_at")
+        fields = (
+            "id",
+            "key",
+            "type_label",
+            "subtype",
+            "label",
+            "body",
+            "created_at",
+            "updated_at",
+        )
 
     def get_type_label(self, obj: SiteContentSlot) -> str:
         try:
@@ -188,6 +206,7 @@ class SiteContentSlotReadSerializer(serializers.ModelSerializer):
 
 class SiteContentSlotCreateSerializer(serializers.Serializer):
     key = serializers.ChoiceField(choices=SiteContentSlot.SlotType.choices)
+    subtype = serializers.SlugField(max_length=64, required=False, allow_blank=True)
     label = serializers.CharField(max_length=255, required=False, allow_blank=True)
     body = serializers.CharField(required=False, allow_blank=True, max_length=500_000)
 
@@ -197,11 +216,19 @@ class SiteContentSlotCreateSerializer(serializers.Serializer):
     def validate_body(self, value: str) -> str:
         return value or ""
 
+    def validate(self, attrs: dict) -> dict:
+        # `subtype` is only meaningful for entry slots; force-empty for others.
+        if attrs.get("key") != SiteContentSlot.SlotType.ENTRY.value:
+            attrs["subtype"] = ""
+        else:
+            attrs["subtype"] = (attrs.get("subtype") or "").strip()
+        return attrs
+
 
 class SiteContentSlotPatchSerializer(serializers.ModelSerializer):
     class Meta:
         model = SiteContentSlot
-        fields = ("label", "body")
+        fields = ("subtype", "label", "body")
 
     def validate_label(self, value: str | None) -> str:
         if value is None:
@@ -212,6 +239,16 @@ class SiteContentSlotPatchSerializer(serializers.ModelSerializer):
         if value is None:
             return ""
         return str(value)
+
+    def validate_subtype(self, value: str | None) -> str:
+        return (value or "").strip()
+
+    def validate(self, attrs: dict) -> dict:
+        instance = getattr(self, "instance", None)
+        if "subtype" in attrs and instance is not None:
+            if instance.key != SiteContentSlot.SlotType.ENTRY.value:
+                attrs["subtype"] = ""
+        return attrs
 
 
 _SITE_MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -328,3 +365,410 @@ class SiteMediaBulkGroupSerializer(serializers.Serializer):
 
 class SiteMediaBulkDeleteSerializer(serializers.Serializer):
     media_ids = serializers.ListField(child=serializers.IntegerField(min_value=1), min_length=1)
+
+
+class _SiteProfileMediaRefField(serializers.IntegerField):
+    """Accept a numeric `SiteMedia` id (or null) that belongs to the contextual site."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_null", True)
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("min_value", 1)
+        super().__init__(*args, **kwargs)
+
+    def to_internal_value(self, data):
+        if data in (None, "", 0, "0"):
+            return None
+        value = super().to_internal_value(data)
+        site = self.context.get("site")
+        if site is not None and not SiteMedia.objects.filter(pk=value, site=site).exists():
+            raise serializers.ValidationError("Unknown media id for this site.")
+        return value
+
+
+class _SiteProfileNavLinkSerializer(serializers.Serializer):
+    label = serializers.CharField(max_length=64, allow_blank=False)
+    path = serializers.CharField(max_length=200, allow_blank=False)
+
+    def validate_label(self, value: str) -> str:
+        t = str(value or "").strip()
+        if not t:
+            raise serializers.ValidationError("Label is required.")
+        return t
+
+    def validate_path(self, value: str) -> str:
+        t = str(value or "").strip()
+        if not t:
+            raise serializers.ValidationError("Path is required.")
+        return t
+
+
+class SiteProfileReadSerializer(serializers.ModelSerializer):
+    logo_id = serializers.SerializerMethodField()
+    favicon_id = serializers.SerializerMethodField()
+    og_image_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SiteProfile
+        fields = (
+            "display_name",
+            "short_name",
+            "tagline",
+            "summary",
+            "logo_id",
+            "favicon_id",
+            "canonical_url",
+            "seo_title",
+            "title_template",
+            "meta_description",
+            "og_image_id",
+            "robots_index",
+            "twitter_handle",
+            "contact_email",
+            "contact_phone",
+            "contact_address",
+            "contact_region",
+            "contact_consent_text",
+            "contact_topics",
+            "social_facebook",
+            "social_x",
+            "social_instagram",
+            "social_linkedin",
+            "social_youtube",
+            "social_whatsapp",
+            "nav_links",
+            "nav_cta_label",
+            "nav_cta_path",
+            "html_lang",
+            "og_locale",
+            "timezone",
+            "date_format",
+            "primary_color",
+            "accent_color",
+            "heading_font",
+            "body_font",
+            "analytics_id",
+            "maintenance_enabled",
+            "maintenance_message",
+            "copyright_name",
+            "created_at",
+            "updated_at",
+        )
+
+    def get_logo_id(self, obj: SiteProfile) -> int | None:
+        return obj.logo_id
+
+    def get_favicon_id(self, obj: SiteProfile) -> int | None:
+        return obj.favicon_id
+
+    def get_og_image_id(self, obj: SiteProfile) -> int | None:
+        return obj.og_image_id
+
+
+class SiteProfilePatchSerializer(serializers.Serializer):
+    """Patch any subset of the profile. All fields are optional on PATCH."""
+
+    display_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    short_name = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    tagline = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    summary = serializers.CharField(required=False, allow_blank=True, max_length=4000)
+    logo_id = _SiteProfileMediaRefField()
+    favicon_id = _SiteProfileMediaRefField()
+
+    canonical_url = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    seo_title = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    title_template = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    meta_description = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+    og_image_id = _SiteProfileMediaRefField()
+    robots_index = serializers.BooleanField(required=False)
+    twitter_handle = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
+    contact_email = serializers.EmailField(max_length=254, required=False, allow_blank=True)
+    contact_phone = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    contact_address = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+    contact_region = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    contact_consent_text = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+    contact_topics = serializers.ListField(
+        child=serializers.CharField(max_length=80, allow_blank=False),
+        required=False,
+        allow_empty=True,
+        max_length=20,
+    )
+
+    social_facebook = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    social_x = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    social_instagram = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    social_linkedin = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    social_youtube = serializers.URLField(max_length=500, required=False, allow_blank=True)
+    social_whatsapp = serializers.URLField(max_length=500, required=False, allow_blank=True)
+
+    nav_links = _SiteProfileNavLinkSerializer(many=True, required=False, allow_empty=True)
+    nav_cta_label = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    nav_cta_path = serializers.CharField(max_length=200, required=False, allow_blank=True)
+
+    html_lang = serializers.CharField(max_length=16, required=False, allow_blank=True)
+    og_locale = serializers.CharField(max_length=16, required=False, allow_blank=True)
+    timezone = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    date_format = serializers.CharField(max_length=32, required=False, allow_blank=True)
+
+    primary_color = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    accent_color = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    heading_font = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    body_font = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+    analytics_id = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    maintenance_enabled = serializers.BooleanField(required=False)
+    maintenance_message = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+    copyright_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+
+    def _trim_str(self, value):
+        return "" if value is None else str(value).strip()
+
+    def validate_contact_topics(self, value):
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in value or []:
+            t = str(item or "").strip()
+            if not t:
+                continue
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t[:80])
+        return out
+
+    def validate_nav_links(self, value):
+        seen: set[str] = set()
+        out: list[dict] = []
+        for entry in value or []:
+            label = (entry.get("label") or "").strip() if isinstance(entry, dict) else ""
+            path = (entry.get("path") or "").strip() if isinstance(entry, dict) else ""
+            if not label or not path:
+                continue
+            key = path.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"label": label[:64], "path": path[:200]})
+        return out
+
+    def validate(self, attrs: dict) -> dict:
+        # Trim every string-like value so we don't store leading/trailing spaces.
+        for k, v in list(attrs.items()):
+            if isinstance(v, str):
+                attrs[k] = v.strip()
+        return attrs
+
+    def apply(self, instance: SiteProfile) -> SiteProfile:
+        """Apply validated_data to the instance and save only the fields we touched."""
+        data = self.validated_data
+        media_field_map = {
+            "logo_id": "logo_id",
+            "favicon_id": "favicon_id",
+            "og_image_id": "og_image_id",
+        }
+        update_fields: list[str] = []
+        for key, value in data.items():
+            target = media_field_map.get(key, key)
+            setattr(instance, target, value)
+            update_fields.append(target)
+        if update_fields:
+            update_fields.append("updated_at")
+            instance.save(update_fields=update_fields)
+        return instance
+
+
+# --------------------------------------------------------------------------- #
+# Page (composable page sections)                                              #
+# --------------------------------------------------------------------------- #
+
+# Each `/`-delimited segment of a page slug must look like a URL-friendly token.
+_PAGE_SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_PAGE_SLUG_MAX_LEN = 255
+
+# Bump when the body envelope shape changes. Section kinds evolve
+# independently (each kind in `@pywe/cms-sections/kinds` versions itself).
+_PAGE_BODY_SUPPORTED_VERSIONS = frozenset({1})
+
+# Documented SEO keys. Unknown keys are silently dropped on read+write so
+# rolling out a new key is purely additive (manager ships first; backend
+# version-bump comes whenever it's convenient).
+_PAGE_SEO_KEYS = ("description", "ogImage", "noindex")
+
+
+def _normalise_page_slug(raw: str | None) -> str:
+    """Lowercase, strip surrounding slashes, validate segments.
+
+    Empty string represents the homepage and is returned as-is. Validation
+    failures raise `ValidationError`; the caller decides what HTTP status that
+    maps to (DRF handles 400 by default).
+    """
+    s = (raw or "").strip().strip("/").lower()
+    if not s:
+        return ""
+    if len(s) > _PAGE_SLUG_MAX_LEN:
+        raise serializers.ValidationError(
+            f"Slug is too long (max {_PAGE_SLUG_MAX_LEN} characters)."
+        )
+    for segment in s.split("/"):
+        if not _PAGE_SLUG_SEGMENT_RE.fullmatch(segment):
+            raise serializers.ValidationError(
+                f"Invalid slug segment {segment!r}: use lowercase letters, "
+                "digits, and dashes; separate segments with '/'."
+            )
+    return s
+
+
+def _validate_page_body_json(raw: str | None) -> str:
+    """Parse and validate the section envelope; return the canonical JSON string.
+
+    Empty payloads are allowed (= empty page). When non-empty, the value must
+    parse to `{"v": <supported>, "sections": [{id, kind, value}, ...]}`.
+    The serialized string is returned verbatim (no re-serialization) so
+    insignificant whitespace round-trips intact, and so unknown extra
+    top-level keys (forward-compat additions) survive the trip through the
+    backend without losing information.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        parsed = json.loads(s)
+    except json.JSONDecodeError as exc:
+        raise serializers.ValidationError(f"body must be valid JSON: {exc.msg}.")
+    if not isinstance(parsed, dict):
+        raise serializers.ValidationError("body must be a JSON object.")
+
+    version = parsed.get("v")
+    if version not in _PAGE_BODY_SUPPORTED_VERSIONS:
+        raise serializers.ValidationError(
+            f"Unsupported body version {version!r}; "
+            f"supported: {sorted(_PAGE_BODY_SUPPORTED_VERSIONS)}."
+        )
+
+    sections = parsed.get("sections")
+    if not isinstance(sections, list):
+        raise serializers.ValidationError("body.sections must be an array.")
+
+    for idx, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise serializers.ValidationError(
+                f"body.sections[{idx}] must be an object."
+            )
+        for key in ("id", "kind", "value"):
+            if key not in section:
+                raise serializers.ValidationError(
+                    f"body.sections[{idx}].{key} is required."
+                )
+            if not isinstance(section[key], str):
+                raise serializers.ValidationError(
+                    f"body.sections[{idx}].{key} must be a string."
+                )
+        if not section["id"].strip():
+            raise serializers.ValidationError(
+                f"body.sections[{idx}].id must be a non-empty string."
+            )
+        if not section["kind"].strip():
+            raise serializers.ValidationError(
+                f"body.sections[{idx}].kind must be a non-empty string."
+            )
+
+    return s
+
+
+def _normalise_page_seo(raw) -> dict:
+    """Keep documented SEO keys with the right types; drop everything else."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise serializers.ValidationError("seo must be a JSON object.")
+    out: dict = {}
+    if "description" in raw:
+        value = raw["description"]
+        if value is not None and not isinstance(value, str):
+            raise serializers.ValidationError("seo.description must be a string.")
+        if value:
+            out["description"] = str(value).strip()[:500]
+    if "ogImage" in raw:
+        value = raw["ogImage"]
+        if value is not None and not isinstance(value, str):
+            raise serializers.ValidationError("seo.ogImage must be a string.")
+        if value:
+            out["ogImage"] = str(value).strip()[:500]
+    if "noindex" in raw:
+        value = raw["noindex"]
+        if not isinstance(value, bool):
+            raise serializers.ValidationError("seo.noindex must be a boolean.")
+        out["noindex"] = value
+    # Silently ignore any keys outside _PAGE_SEO_KEYS.
+    _ = _PAGE_SEO_KEYS  # keep the list discoverable from code search
+    return out
+
+
+class PageReadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Page
+        fields = (
+            "id",
+            "slug",
+            "title",
+            "status",
+            "body",
+            "seo",
+            "created_at",
+            "updated_at",
+        )
+
+
+class PageCreateSerializer(serializers.Serializer):
+    """Create payload for a new Page on a site (POST /sites/<slug>/pages/)."""
+
+    slug = serializers.CharField(max_length=_PAGE_SLUG_MAX_LEN, allow_blank=True)
+    title = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    status = serializers.ChoiceField(
+        choices=Page.Status.choices,
+        required=False,
+        default=Page.Status.DRAFT,
+    )
+    body = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=2_000_000,
+    )
+    seo = serializers.JSONField(required=False)
+
+    def validate_slug(self, value: str) -> str:
+        return _normalise_page_slug(value)
+
+    def validate_title(self, value: str | None) -> str:
+        return ("" if value is None else str(value)).strip()[:255]
+
+    def validate_body(self, value: str | None) -> str:
+        return _validate_page_body_json(value)
+
+    def validate_seo(self, value) -> dict:
+        return _normalise_page_seo(value)
+
+
+class PagePatchSerializer(serializers.Serializer):
+    """Update payload — every field optional; missing fields are left unchanged."""
+
+    slug = serializers.CharField(max_length=_PAGE_SLUG_MAX_LEN, required=False, allow_blank=True)
+    title = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    status = serializers.ChoiceField(choices=Page.Status.choices, required=False)
+    body = serializers.CharField(required=False, allow_blank=True, max_length=2_000_000)
+    seo = serializers.JSONField(required=False)
+
+    def validate_slug(self, value: str) -> str:
+        return _normalise_page_slug(value)
+
+    def validate_title(self, value: str | None) -> str:
+        return ("" if value is None else str(value)).strip()[:255]
+
+    def validate_body(self, value: str | None) -> str:
+        return _validate_page_body_json(value)
+
+    def validate_seo(self, value) -> dict:
+        return _normalise_page_seo(value)
+

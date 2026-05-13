@@ -31,6 +31,16 @@ urlpatterns = [
         name="manager-site-content-slots",
     ),
     path(
+        "sites/<slug:site_slug>/pages/<int:page_id>/",
+        views.SitePageDetailView.as_view(),
+        name="manager-site-page-detail",
+    ),
+    path(
+        "sites/<slug:site_slug>/pages/",
+        views.SitePageListCreateView.as_view(),
+        name="manager-site-pages",
+    ),
+    path(
         "sites/<slug:site_slug>/media/bulk-group/",
         views.SiteMediaBulkGroupView.as_view(),
         name="manager-site-media-bulk-group",
@@ -54,6 +64,11 @@ urlpatterns = [
         "sites/<slug:site_slug>/media/",
         views.SiteMediaListCreateView.as_view(),
         name="manager-site-media",
+    ),
+    path(
+        "sites/<slug:site_slug>/profile/",
+        views.SiteProfileView.as_view(),
+        name="manager-site-profile",
     ),
     path("sites/<slug:site_slug>/", views.SiteDetailView.as_view(), name="manager-site-detail"),
 ]
