@@ -6,16 +6,16 @@ services:
   # ───────────────────────────────
   db:
     image: postgres:16
-    container_name: makola-db
+    container_name: pywecmsbackend-db
     restart: always
     environment:
-      POSTGRES_DB: makola
-      POSTGRES_USER: makola_user
-      POSTGRES_PASSWORD: makola_pass
+      POSTGRES_DB: pywecmsbackend
+      POSTGRES_USER: pywecmsbackend_user
+      POSTGRES_PASSWORD: pywecmsbackend_pass
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U makola_user -d makola"]
+      test: ["CMD-SHELL", "pg_isready -U pywecmsbackend_user -d pywecmsbackend"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,12 +29,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: makola-apis-web
+    container_name: pywecmsbackend-apis-web
     environment:
       - DOCKER_ENV=true
     command: >
       sh -c "python manage.py migrate &&
-             gunicorn makola.wsgi:application --bind 0.0.0.0:8000 --workers 3"
+             gunicorn pywe_cms_backend.wsgi:application --bind 0.0.0.0:8000 --workers 3"
     env_file:
       - .env
     depends_on:
@@ -56,7 +56,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: makola-job
+    container_name: pywecmsbackend-job
     environment:
       - DOCKER_ENV=true
     command: >
