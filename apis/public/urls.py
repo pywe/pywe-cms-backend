@@ -19,4 +19,14 @@ urlpatterns = [
         views.PublicPageBySlugView.as_view(),
         name="public-page-by-slug",
     ),
+    path(
+        "sites/<slug:workspace_slug>/<slug:site_slug>/slots/",
+        views.PublicSiteContentSlotsView.as_view(),
+        name="public-site-content-slots",
+    ),
+    path(
+        "sites/<slug:workspace_slug>/<slug:site_slug>/media/",
+        views.PublicSiteMediaView.as_view(),
+        name="public-site-media",
+    ),
 ]

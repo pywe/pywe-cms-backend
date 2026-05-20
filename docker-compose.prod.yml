@@ -1,0 +1,88 @@
+version: "3.9"
+
+services:
+  # ───────────────────────────────
+  # DATABASE
+  # ───────────────────────────────
+  db:
+    image: postgres:16
+    container_name: makola-db
+    restart: always
+    environment:
+      POSTGRES_DB: makola
+      POSTGRES_USER: makola_user
+      POSTGRES_PASSWORD: makola_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U makola_user -d makola"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pushr_net
+
+  # ───────────────────────────────
+  # DJANGO WEB (Gunicorn)
+  # ───────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: makola-apis-web
+    environment:
+      - DOCKER_ENV=true
+    command: >
+      sh -c "python manage.py migrate &&
+             gunicorn makola.wsgi:application --bind 0.0.0.0:8000 --workers 3"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    restart: always
+    expose:
+      - "8000"  # internal only
+    networks:
+      - pushr_net
+
+  # ───────────────────────────────
+  # JOB (One-time schema apply)
+  # ───────────────────────────────
+  job:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: makola-job
+    environment:
+      - DOCKER_ENV=true
+    command: >
+      sh -c "
+        python manage.py migrate &&
+        echo '✅ Initialization completed successfully.'
+      "
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    networks:
+      - pushr_net
+    restart: "no"
+
+# ───────────────────────────────
+# VOLUMES & NETWORKS
+# ───────────────────────────────
+volumes:
+  postgres_data:
+  media_data:
+
+networks:
+  pushr_net:
+    external: true  # shared with global caddy
