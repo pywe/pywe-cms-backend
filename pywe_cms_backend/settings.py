@@ -182,6 +182,7 @@ CORS_ALLOW_HEADERS = (
     "x-workspace-slug",
 )
 CORS_ALLOWED_ORIGINS = [
+    "https://cms.pywe.org",
     "https://account.pywe.org",
     "https://pywe.org",
     "https://www.pywe.org",
